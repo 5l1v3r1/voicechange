@@ -1,24 +1,24 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"math"
 	"os"
 
-	"github.com/mjibson/go-dsp/fft"
+	"github.com/unixpickle/autofunc"
+	"github.com/unixpickle/hessfree"
 	"github.com/unixpickle/num-analysis/linalg"
-	"github.com/unixpickle/num-analysis/linalg/ludecomp"
-	"github.com/unixpickle/num-analysis/linalg/qrdecomp"
 	"github.com/unixpickle/wav"
+	"github.com/unixpickle/weakai/neuralnet"
 )
 
 const (
-	WindowSize   = 512
+	WindowSize   = 1024
 	MinAmplitude = 1e-2
-	Damping      = 1e-5
+	HiddenSize1  = 300
+	HiddenSize2  = 300
+	MaxSubBatch  = 20
 )
 
 func main() {
@@ -48,60 +48,58 @@ func genCommand() {
 
 	outPath := os.Args[4]
 	sourceVecs, targetVecs := sourceTargetVecs(readAudioFiles(os.Args[2], os.Args[3]))
+	samples := neuralnet.VectorSampleSet(sourceVecs, targetVecs)
 
-	if len(sourceVecs) < WindowSize {
-		fmt.Fprintf(os.Stderr, "Not enough samples (have %d need %d)\n",
-			len(sourceVecs), WindowSize)
-		os.Exit(1)
+	network := neuralnet.Network{
+		/*&neuralnet.RescaleLayer{
+			Bias:  -average,
+			Scale: 1 / stddev,
+		},*/
+		&neuralnet.DenseLayer{
+			InputCount:  WindowSize,
+			OutputCount: HiddenSize1,
+		},
+		neuralnet.HyperbolicTangent{},
+		&neuralnet.DenseLayer{
+			InputCount:  HiddenSize1,
+			OutputCount: HiddenSize2,
+		},
+		neuralnet.HyperbolicTangent{},
+		&neuralnet.DenseLayer{
+			InputCount:  HiddenSize2,
+			OutputCount: WindowSize,
+		},
 	}
+	network.Randomize()
 
-	sourceMat := vecMatrix(sourceVecs)
-	targetMat := vecMatrix(targetVecs)
-
-	log.Printf("Creating QR decomposition with %d samples...", len(sourceVecs))
-	for i := 0; i < sourceMat.Cols && i < sourceMat.Rows; i++ {
-		sourceMat.Set(i, i, sourceMat.Get(i, i)+Damping)
+	ui := hessfree.NewConsoleUI()
+	learner := &hessfree.DampingLearner{
+		WrappedLearner: &hessfree.NeuralNetLearner{
+			Layers:         network,
+			Output:         nil,
+			Cost:           neuralnet.MeanSquaredCost{},
+			MaxSubBatch:    MaxSubBatch,
+			MaxConcurrency: 2,
+		},
+		DampingCoeff: 2,
+		UI:           ui,
 	}
-	q, r := qrdecomp.Householder(sourceMat)
-	rInv := ludecomp.Decompose(r)
-	qInv := q.Transpose()
-
-	log.Println("Solving least-squares matrix...")
-	bTranspose := qInv.Mul(targetMat).Transpose()
-	var result linalg.Vector
-	for i := 0; i < bTranspose.Rows; i++ {
-		rowVec := bTranspose.Data[bTranspose.Cols*i : bTranspose.Cols*(i+1)]
-		result = append(result, rInv.Solve(rowVec)...)
+	trainer := hessfree.Trainer{
+		Learner:   learner,
+		Samples:   samples,
+		BatchSize: samples.Len(),
+		UI:        ui,
+		Convergence: hessfree.ConvergenceCriteria{
+			MinK: 5,
+		},
 	}
+	trainer.Train()
 
-	log.Println("Saving result...")
-	resultMat := &linalg.Matrix{
-		Rows: WindowSize,
-		Cols: WindowSize,
-		Data: result,
-	}
-	encoded, _ := json.Marshal(resultMat)
+	encoded, _ := network.Serialize()
 	if err := ioutil.WriteFile(outPath, encoded, 0755); err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to save:", err)
 		os.Exit(1)
 	}
-
-	log.Println("Measuring error...")
-	var targetMag, totalError, totalTransError float64
-	for i, sourceVec := range sourceVecs {
-		negTarget := targetVecs[i].Copy().Scale(-1)
-
-		targetMag += negTarget.Dot(negTarget)
-
-		diff := sourceVec.Copy().Add(negTarget)
-		totalError += diff.Dot(diff)
-
-		newSource := linalg.Vector(resultMat.Mul(linalg.NewMatrixColumn(sourceVec)).Data)
-		diff1 := newSource.Add(negTarget)
-		totalTransError += diff1.Dot(diff1)
-	}
-	log.Println("Total error:", totalError, "(no trans)", totalTransError, "(trans)",
-		targetMag, "(target mag)")
 }
 
 func translateCommand() {
@@ -111,15 +109,15 @@ func translateCommand() {
 
 	outPath := os.Args[4]
 
-	matData, err := ioutil.ReadFile(os.Args[2])
+	netData, err := ioutil.ReadFile(os.Args[2])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to read matrix:", err)
+		fmt.Fprintln(os.Stderr, "Failed to read network:", err)
 		os.Exit(1)
 	}
 
-	var mat linalg.Matrix
-	if err := json.Unmarshal(matData, &mat); err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to parse matrix:", err)
+	network, err := neuralnet.DeserializeNetwork(netData)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to parse network:", err)
 		os.Exit(1)
 	}
 
@@ -132,14 +130,12 @@ func translateCommand() {
 	inSamples := source.Samples()
 	var outSamples []wav.Sample
 
-	inVec := linalg.NewMatrix(mat.Rows, 1)
-	for i := 0; i+mat.Rows <= len(inSamples); i += mat.Rows {
-		for j := 0; j < mat.Rows; j++ {
-			inVec.Data[j] = float64(inSamples[i+j])
+	inVec := make(linalg.Vector, WindowSize)
+	for i := 0; i+WindowSize <= len(inSamples); i += WindowSize {
+		for j := 0; j < WindowSize; j++ {
+			inVec[j] = float64(inSamples[i+j])
 		}
-		forwardFFT(inVec.Data)
-		outVec := mat.Mul(inVec).Data
-		backwardFFT(outVec)
+		outVec := network.Apply(&autofunc.Variable{Vector: inVec}).Output()
 		for _, k := range outVec {
 			k = math.Max(math.Min(k, 1), -1)
 			outSamples = append(outSamples, wav.Sample(k))
@@ -185,8 +181,6 @@ func sourceTargetVecs(source, target wav.Sound) (inVecs, outVecs []linalg.Vector
 			inVec[j] = float64(inSamples[i+j])
 			outVec[j] = float64(outSamples[i+j])
 		}
-		forwardFFT(inVec)
-		forwardFFT(outVec)
 		if inVec.Dot(inVec) < MinAmplitude || outVec.Dot(outVec) < MinAmplitude {
 			continue
 		}
@@ -195,43 +189,4 @@ func sourceTargetVecs(source, target wav.Sound) (inVecs, outVecs []linalg.Vector
 	}
 
 	return
-}
-
-func vecMatrix(rows []linalg.Vector) *linalg.Matrix {
-	colCount := len(rows[0])
-	res := &linalg.Matrix{
-		Rows: len(rows),
-		Cols: colCount,
-		Data: make(linalg.Vector, colCount*len(rows)),
-	}
-	var idx int
-	for _, x := range rows {
-		copy(res.Data[idx:], x)
-		idx += len(x)
-	}
-	return res
-}
-
-func forwardFFT(data linalg.Vector) {
-	res := fft.FFTReal(data)
-	for i := 0; i < len(res); i++ {
-		res[i] = complex(real(res[i]), 0)
-	}
-	/*for i := 200; i < len(res); i++ {
-		res[i] = 0
-	}*/
-	for i, x := range res {
-		data[i] = real(x)
-	}
-}
-
-func backwardFFT(data linalg.Vector) {
-	res := make([]complex128, len(data))
-	for i, x := range data {
-		res[i] = complex(x, 0)
-	}
-	res = fft.IFFT(res)
-	for i, x := range res {
-		data[i] = real(x)
-	}
 }
