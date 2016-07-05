@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 
+	"github.com/mjibson/go-dsp/fft"
 	"github.com/unixpickle/num-analysis/linalg"
 	"github.com/unixpickle/num-analysis/linalg/ludecomp"
 	"github.com/unixpickle/num-analysis/linalg/qrdecomp"
@@ -15,8 +16,9 @@ import (
 )
 
 const (
-	WindowSize   = 1500
+	WindowSize   = 512
 	MinAmplitude = 1e-2
+	Damping      = 1e-5
 )
 
 func main() {
@@ -57,6 +59,9 @@ func genCommand() {
 	targetMat := vecMatrix(targetVecs)
 
 	log.Printf("Creating QR decomposition with %d samples...", len(sourceVecs))
+	for i := 0; i < sourceMat.Cols && i < sourceMat.Rows; i++ {
+		sourceMat.Set(i, i, sourceMat.Get(i, i)+Damping)
+	}
 	q, r := qrdecomp.Householder(sourceMat)
 	rInv := ludecomp.Decompose(r)
 	qInv := q.Transpose()
@@ -132,7 +137,9 @@ func translateCommand() {
 		for j := 0; j < mat.Rows; j++ {
 			inVec.Data[j] = float64(inSamples[i+j])
 		}
+		forwardFFT(inVec.Data)
 		outVec := mat.Mul(inVec).Data
+		backwardFFT(outVec)
 		for _, k := range outVec {
 			k = math.Max(math.Min(k, 1), -1)
 			outSamples = append(outSamples, wav.Sample(k))
@@ -178,6 +185,8 @@ func sourceTargetVecs(source, target wav.Sound) (inVecs, outVecs []linalg.Vector
 			inVec[j] = float64(inSamples[i+j])
 			outVec[j] = float64(outSamples[i+j])
 		}
+		forwardFFT(inVec)
+		forwardFFT(outVec)
 		if inVec.Dot(inVec) < MinAmplitude || outVec.Dot(outVec) < MinAmplitude {
 			continue
 		}
@@ -201,4 +210,28 @@ func vecMatrix(rows []linalg.Vector) *linalg.Matrix {
 		idx += len(x)
 	}
 	return res
+}
+
+func forwardFFT(data linalg.Vector) {
+	res := fft.FFTReal(data)
+	for i := 0; i < len(res); i++ {
+		res[i] = complex(real(res[i]), 0)
+	}
+	/*for i := 200; i < len(res); i++ {
+		res[i] = 0
+	}*/
+	for i, x := range res {
+		data[i] = real(x)
+	}
+}
+
+func backwardFFT(data linalg.Vector) {
+	res := make([]complex128, len(data))
+	for i, x := range data {
+		res[i] = complex(x, 0)
+	}
+	res = fft.IFFT(res)
+	for i, x := range res {
+		data[i] = real(x)
+	}
 }
