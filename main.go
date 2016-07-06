@@ -17,7 +17,7 @@ const (
 	WindowSize   = 1024
 	MinAmplitude = 1e-2
 	HiddenSize1  = 300
-	HiddenSize2  = 300
+	HiddenSize2  = 500
 	MaxSubBatch  = 20
 )
 
@@ -81,7 +81,8 @@ func genCommand() {
 			MaxSubBatch:    MaxSubBatch,
 			MaxConcurrency: 2,
 		},
-		DampingCoeff: 2,
+		DampingCoeff: 0.1,
+		UseQuadMin:   true,
 		UI:           ui,
 	}
 	trainer := hessfree.Trainer{
