@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math"
 	"os"
 
@@ -50,27 +51,36 @@ func genCommand() {
 	sourceVecs, targetVecs := sourceTargetVecs(readAudioFiles(os.Args[2], os.Args[3]))
 	samples := neuralnet.VectorSampleSet(sourceVecs, targetVecs)
 
-	network := neuralnet.Network{
-		/*&neuralnet.RescaleLayer{
-			Bias:  -average,
-			Scale: 1 / stddev,
-		},*/
-		&neuralnet.DenseLayer{
-			InputCount:  WindowSize,
-			OutputCount: HiddenSize1,
-		},
-		neuralnet.HyperbolicTangent{},
-		&neuralnet.DenseLayer{
-			InputCount:  HiddenSize1,
-			OutputCount: HiddenSize2,
-		},
-		neuralnet.HyperbolicTangent{},
-		&neuralnet.DenseLayer{
-			InputCount:  HiddenSize2,
-			OutputCount: WindowSize,
-		},
+	var network neuralnet.Network
+
+	netData, err := ioutil.ReadFile(outPath)
+	if err == nil {
+		network, err = neuralnet.DeserializeNetwork(netData)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to load network:", err)
+			os.Exit(1)
+		}
+		log.Println("Loaded network from file.")
+	} else {
+		network = neuralnet.Network{
+			&neuralnet.DenseLayer{
+				InputCount:  WindowSize,
+				OutputCount: HiddenSize1,
+			},
+			neuralnet.HyperbolicTangent{},
+			&neuralnet.DenseLayer{
+				InputCount:  HiddenSize1,
+				OutputCount: HiddenSize2,
+			},
+			neuralnet.HyperbolicTangent{},
+			&neuralnet.DenseLayer{
+				InputCount:  HiddenSize2,
+				OutputCount: WindowSize,
+			},
+		}
+		network.Randomize()
+		log.Println("Created new network.")
 	}
-	network.Randomize()
 
 	ui := hessfree.NewConsoleUI()
 	learner := &hessfree.DampingLearner{
